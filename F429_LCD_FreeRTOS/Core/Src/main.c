@@ -61,9 +61,10 @@ osThreadId defaultTaskHandle;
 TaskHandle_t *LED_task1;
 TaskHandle_t *LED_task2;
 TaskHandle_t *LED_task3;
+QueueHandle_t  ADC_queue;
 
 static int y_diff = 10;
-uint16_t DMA_buffer[4];
+uint16_t DMA_buffer;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -84,6 +85,7 @@ void StartDefaultTask(void const * argument);
 //void LED_task2_entry(void);
 //void LED_task3_entry(void);
 void convert_to_ASCII(int number, uint8_t* ascii);
+void LCD_init(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -101,15 +103,13 @@ void convert_to_ASCII(int number, uint8_t* ascii)
 
 void LED_task1_entry()
 {
-	uint8_t ascii[3];
-	convert_to_ASCII(420, ascii);
+	uint16_t received_from_ADC;
 	while(1)
 	{
-//		BSP_LCD_Clear(LCD_COLOR_LIGHTBLUE);
-//		y += y_diff;
-//		BSP_LCD_DrawCircle(80, y, 40);
-		BSP_LCD_DisplayStringAt(80, 80, ascii, CENTER_MODE);
-		vTaskDelay(500);
+		xQueueReceive(ADC_queue, &received_from_ADC, 0);
+		BSP_LCD_Clear(LCD_COLOR_WHITE);
+		BSP_LCD_DisplayStringAt(80, 80, (uint8_t*)&received_from_ADC, CENTER_MODE);
+		vTaskDelay(1);
 	}
 }
 
@@ -139,10 +139,42 @@ void LED_task3_entry()
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* AdcHandle)
 {
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 	if (AdcHandle == &hadc1)
 	{
 		HAL_GPIO_TogglePin(LD4_GPIO_Port, LD4_Pin);
+		xQueueSendFromISR(ADC_queue, (void*)&DMA_buffer, &xHigherPriorityTaskWoken);
+
+		if(xHigherPriorityTaskWoken)
+		{
+			portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+		}
 	}
+}
+
+void LCD_init()
+{
+	BSP_LCD_Init();
+
+	BSP_LCD_LayerDefaultInit(1, LCD_FRAME_BUFFER_LAYER1);
+	/* Set Foreground Layer */
+	BSP_LCD_SelectLayer(1);
+	/* Clear the LCD */
+	BSP_LCD_Clear(LCD_COLOR_DARKRED);
+	BSP_LCD_SetColorKeying(1, LCD_COLOR_WHITE);
+	BSP_LCD_SetLayerVisible(1, DISABLE);
+
+	/* Layer1 Init */
+	BSP_LCD_LayerDefaultInit(0, LCD_FRAME_BUFFER_LAYER0);
+
+	/* Set Foreground Layer */
+	BSP_LCD_SelectLayer(0);
+
+	/* Enable The LCD */
+	BSP_LCD_DisplayOn();
+
+	/* Clear the LCD */
+	BSP_LCD_Clear(LCD_COLOR_LIGHTBLUE);
 }
 /* USER CODE END 0 */
 
@@ -184,29 +216,9 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_Base_Start_IT(&htim3);
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)DMA_buffer, 4);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&DMA_buffer, 1);
 
-  BSP_LCD_Init();
-
-  BSP_LCD_LayerDefaultInit(1, LCD_FRAME_BUFFER_LAYER1);
-     /* Set Foreground Layer */
-  BSP_LCD_SelectLayer(1);
-   /* Clear the LCD */
-  BSP_LCD_Clear(LCD_COLOR_DARKRED);
-  BSP_LCD_SetColorKeying(1, LCD_COLOR_WHITE);
-  BSP_LCD_SetLayerVisible(1, DISABLE);
-
-  /* Layer1 Init */
-  BSP_LCD_LayerDefaultInit(0, LCD_FRAME_BUFFER_LAYER0);
-
-  /* Set Foreground Layer */
-  BSP_LCD_SelectLayer(0);
-
-  /* Enable The LCD */
-  BSP_LCD_DisplayOn();
-
-  /* Clear the LCD */
-  BSP_LCD_Clear(LCD_COLOR_LIGHTBLUE);
+  LCD_init();
 
 //  BSP_LCD_DrawCircle(80, 80, 40);
 //  BSP_LCD_DrawCircle(160, 80, 40);
@@ -227,6 +239,7 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+  ADC_queue = xQueueCreate(3, sizeof(uint16_t));
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -237,8 +250,8 @@ int main(void)
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   xTaskCreate(LED_task1_entry, "LED Task1", configMINIMAL_STACK_SIZE, NULL, 3, LED_task1);
-  xTaskCreate(LED_task2_entry, "LED Task2", configMINIMAL_STACK_SIZE, NULL, 3, LED_task2);
-  xTaskCreate(LED_task3_entry, "LED Task3", configMINIMAL_STACK_SIZE, NULL, 3, LED_task3);
+  //xTaskCreate(LED_task2_entry, "LED Task2", configMINIMAL_STACK_SIZE, NULL, 3, LED_task2);
+  //xTaskCreate(LED_task3_entry, "LED Task3", configMINIMAL_STACK_SIZE, NULL, 3, LED_task3);
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -613,7 +626,7 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA2_Stream4_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream4_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream4_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream4_IRQn);
 
 }
