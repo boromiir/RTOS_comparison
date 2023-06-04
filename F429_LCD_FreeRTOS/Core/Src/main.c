@@ -23,6 +23,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stm32f429i_discovery_lcd.h"
+#include "arm_math.h"
+#include "stdbool.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,7 +34,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define ZERO_IN_ASCII  48
+#define ZERO_IN_ASCII	48
+#define APB1_CLOCK		84000000
+#define FFT_SAMPLES		512
+#define FFT_SIZE		(FFT_SAMPLES / 2)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,8 +68,15 @@ TaskHandle_t *LED_task2;
 TaskHandle_t *LED_task3;
 QueueHandle_t  ADC_queue;
 
-static int y_diff = 10;
-uint16_t DMA_buffer;
+uint32_t DMA_buffer;
+
+float32_t FFT_input[FFT_SAMPLES] = {0};
+float32_t FFT_output[FFT_SAMPLES];
+float32_t freqTable[FFT_SIZE];
+float32_t freqOrder[FFT_SIZE];
+
+float32_t baseFreq;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -86,6 +98,8 @@ void StartDefaultTask(void const * argument);
 //void LED_task3_entry(void);
 void convert_to_ASCII(int number, uint8_t* ascii);
 void LCD_init(void);
+void FFT_init(float32_t samplingFreq);
+void copy_table(float32_t *from, float32_t *to, uint32_t no_of_items);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -101,12 +115,54 @@ void convert_to_ASCII(int number, uint8_t* ascii)
 	ascii[2] = ones + ZERO_IN_ASCII;
 }
 
+void FFT_init(float32_t samplingFreq)
+{
+	for(uint16_t i = 0; i < FFT_SIZE; i++)
+	{
+		freqOrder[i] = i * samplingFreq / FFT_SAMPLES;
+	}
+}
+
+void copy_table(float32_t *from, float32_t *to, uint32_t no_of_items)
+{
+	for (int i = 0; i < no_of_items; i++)
+	{
+		to[i] = from[i];
+	}
+}
+
 void LED_task1_entry()
 {
-	uint16_t received_from_ADC;
+	uint32_t received_from_ADC;
+
+	uint16_t freqBufferIndex = 0;
+	uint32_t maxFFTValueIndex = 0;
+	float32_t maxFFTValue = 0;
+	bool firstBufferFull = false;
+	float32_t f_s = APB1_CLOCK / (htim3.Init.Prescaler + 1) / (htim3.Init.Period + 1);
+	arm_rfft_fast_instance_f32 FFTHandler;
+
+	FFT_init(f_s);
+	arm_rfft_fast_init_f32(&FFTHandler, FFT_SAMPLES);
+
 	while(1)
 	{
-		xQueueReceive(ADC_queue, &received_from_ADC, 0);
+		xQueueReceive(ADC_queue, &received_from_ADC, portMAX_DELAY);
+		HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+
+		FFT_input[freqBufferIndex] = (float32_t)received_from_ADC;
+		freqBufferIndex++;
+		if(freqBufferIndex >= FFT_SAMPLES)
+		{
+			freqBufferIndex = 0;
+
+			arm_rfft_fast_f32(&FFTHandler, FFT_input, FFT_output, 0);
+			arm_cmplx_mag_f32(FFT_output, freqTable, FFT_SIZE);
+			arm_max_f32(freqTable + 1, FFT_SIZE - 1, &maxFFTValue, &maxFFTValueIndex);
+		}
+
+		baseFreq = freqOrder[maxFFTValueIndex];
+
 		BSP_LCD_Clear(LCD_COLOR_WHITE);
 		BSP_LCD_DisplayStringAt(80, 80, (uint8_t*)&received_from_ADC, CENTER_MODE);
 		vTaskDelay(1);
@@ -115,25 +171,17 @@ void LED_task1_entry()
 
 void LED_task2_entry()
 {
-	int y = 70;
 	while(1)
 	{
-		BSP_LCD_Clear(LCD_COLOR_LIGHTBLUE);
-		y += y_diff;
-		BSP_LCD_DrawCircle(160, y, 40);
-		vTaskDelay(500);
+
 	}
 }
 
 void LED_task3_entry()
 {
-	int y = 170;
 	while(1)
 	{
-		BSP_LCD_Clear(LCD_COLOR_LIGHTBLUE);
-		y += y_diff;
-		BSP_LCD_DrawEllipse(120, y, 20, 100);
-		vTaskDelay(500);
+
 	}
 }
 
@@ -215,8 +263,6 @@ int main(void)
   MX_ADC1_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_Base_Start_IT(&htim3);
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&DMA_buffer, 1);
 
   LCD_init();
 
@@ -239,7 +285,7 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
-  ADC_queue = xQueueCreate(3, sizeof(uint16_t));
+  ADC_queue = xQueueCreate(3, sizeof(uint32_t));
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -252,6 +298,9 @@ int main(void)
   xTaskCreate(LED_task1_entry, "LED Task1", configMINIMAL_STACK_SIZE, NULL, 3, LED_task1);
   //xTaskCreate(LED_task2_entry, "LED Task2", configMINIMAL_STACK_SIZE, NULL, 3, LED_task2);
   //xTaskCreate(LED_task3_entry, "LED Task3", configMINIMAL_STACK_SIZE, NULL, 3, LED_task3);
+
+  HAL_TIM_Base_Start_IT(&htim3);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&DMA_buffer, 1);
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -591,7 +640,7 @@ static void MX_TIM3_Init(void)
   htim3.Instance = TIM3;
   htim3.Init.Prescaler = 8400-1;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 10000;
+  htim3.Init.Period = 10;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
@@ -837,7 +886,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   }
   /* USER CODE BEGIN Callback 1 */
   if (htim->Instance == TIM3) {
-     HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+     //HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
    }
   /* USER CODE END Callback 1 */
 }
