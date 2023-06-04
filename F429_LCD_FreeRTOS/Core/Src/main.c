@@ -35,6 +35,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define ZERO_IN_ASCII	48
+#define DOT_IN_ASCII	46
 #define APB1_CLOCK		84000000
 #define FFT_SAMPLES		512
 #define FFT_SIZE		(FFT_SAMPLES / 2)
@@ -67,6 +68,7 @@ TaskHandle_t *LED_task1;
 TaskHandle_t *LED_task2;
 TaskHandle_t *LED_task3;
 QueueHandle_t  ADC_queue;
+QueueHandle_t  LCD_queue;
 
 uint32_t DMA_buffer;
 
@@ -74,6 +76,7 @@ float32_t FFT_input[FFT_SAMPLES] = {0};
 float32_t FFT_output[FFT_SAMPLES];
 float32_t freqTable[FFT_SIZE];
 float32_t freqOrder[FFT_SIZE];
+arm_rfft_fast_instance_f32 FFTHandler;
 
 float32_t baseFreq;
 
@@ -96,23 +99,29 @@ void StartDefaultTask(void const * argument);
 //void LED_task1_entry(void);
 //void LED_task2_entry(void);
 //void LED_task3_entry(void);
-void convert_to_ASCII(int number, uint8_t* ascii);
+void convert_to_ASCII(float32_t number, uint8_t* ascii);
 void LCD_init(void);
 void FFT_init(float32_t samplingFreq);
-void copy_table(float32_t *from, float32_t *to, uint32_t no_of_items);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void convert_to_ASCII(int number, uint8_t* ascii)
+void convert_to_ASCII(float32_t number, uint8_t* ascii)
 {
-	int hundreds = number / 100;
-	int tens = (number - (hundreds * 100)) / 10;
-	int ones = (number - (hundreds * 100) - (tens * 10));
+	uint32_t number_without_decimals = number * 100;
+
+	uint8_t hundreds = number_without_decimals / 10000;
+	uint8_t tens = (number_without_decimals - (hundreds * 10000)) / 1000;
+	uint8_t ones = (number_without_decimals - (hundreds * 10000) - (tens * 1000)) / 100;
+	uint8_t decimals = (number_without_decimals - (hundreds * 10000) - (tens * 1000) - (ones * 100)) / 10;
+	uint8_t hundredth = (number_without_decimals - (hundreds * 10000) - (tens * 1000) - (ones * 100) - (decimals * 10));
 
 	ascii[0] = hundreds + ZERO_IN_ASCII;
 	ascii[1] = tens + ZERO_IN_ASCII;
 	ascii[2] = ones + ZERO_IN_ASCII;
+	ascii[3] = DOT_IN_ASCII;
+	ascii[4] = decimals + ZERO_IN_ASCII;
+	ascii[5] = hundredth + ZERO_IN_ASCII;
 }
 
 void FFT_init(float32_t samplingFreq)
@@ -123,24 +132,13 @@ void FFT_init(float32_t samplingFreq)
 	}
 }
 
-void copy_table(float32_t *from, float32_t *to, uint32_t no_of_items)
-{
-	for (int i = 0; i < no_of_items; i++)
-	{
-		to[i] = from[i];
-	}
-}
-
 void LED_task1_entry()
 {
 	uint32_t received_from_ADC;
-
-	uint16_t freqBufferIndex = 0;
 	uint32_t maxFFTValueIndex = 0;
 	float32_t maxFFTValue = 0;
-	bool firstBufferFull = false;
+	uint16_t freqBufferIndex = 0;
 	float32_t f_s = APB1_CLOCK / (htim3.Init.Prescaler + 1) / (htim3.Init.Period + 1);
-	arm_rfft_fast_instance_f32 FFTHandler;
 
 	FFT_init(f_s);
 	arm_rfft_fast_init_f32(&FFTHandler, FFT_SAMPLES);
@@ -152,6 +150,7 @@ void LED_task1_entry()
 
 		FFT_input[freqBufferIndex] = (float32_t)received_from_ADC;
 		freqBufferIndex++;
+
 		if(freqBufferIndex >= FFT_SAMPLES)
 		{
 			freqBufferIndex = 0;
@@ -159,21 +158,28 @@ void LED_task1_entry()
 			arm_rfft_fast_f32(&FFTHandler, FFT_input, FFT_output, 0);
 			arm_cmplx_mag_f32(FFT_output, freqTable, FFT_SIZE);
 			arm_max_f32(freqTable + 1, FFT_SIZE - 1, &maxFFTValue, &maxFFTValueIndex);
+
+			baseFreq = freqOrder[maxFFTValueIndex];
+
+			xQueueSend(LCD_queue, (void*)&baseFreq, 0);
 		}
 
-		baseFreq = freqOrder[maxFFTValueIndex];
-
-		BSP_LCD_Clear(LCD_COLOR_WHITE);
-		BSP_LCD_DisplayStringAt(80, 80, (uint8_t*)&received_from_ADC, CENTER_MODE);
 		vTaskDelay(1);
 	}
 }
 
 void LED_task2_entry()
 {
+	float32_t received_from_FFT;
+	uint8_t display_text[6];
+
 	while(1)
 	{
-
+		xQueueReceive(LCD_queue, &received_from_FFT, portMAX_DELAY);
+		BSP_LCD_Clear(LCD_COLOR_WHITE);
+		convert_to_ASCII(received_from_FFT, display_text);
+		BSP_LCD_DisplayStringAt(80, 80, (uint8_t*)display_text, LEFT_MODE);
+		vTaskDelay(1);
 	}
 }
 
@@ -286,6 +292,7 @@ int main(void)
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
   ADC_queue = xQueueCreate(3, sizeof(uint32_t));
+  LCD_queue = xQueueCreate(3, sizeof(float32_t));
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -296,7 +303,7 @@ int main(void)
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   xTaskCreate(LED_task1_entry, "LED Task1", configMINIMAL_STACK_SIZE, NULL, 3, LED_task1);
-  //xTaskCreate(LED_task2_entry, "LED Task2", configMINIMAL_STACK_SIZE, NULL, 3, LED_task2);
+  xTaskCreate(LED_task2_entry, "LED Task2", configMINIMAL_STACK_SIZE, NULL, 3, LED_task2);
   //xTaskCreate(LED_task3_entry, "LED Task3", configMINIMAL_STACK_SIZE, NULL, 3, LED_task3);
 
   HAL_TIM_Base_Start_IT(&htim3);
