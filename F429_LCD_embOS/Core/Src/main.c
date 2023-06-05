@@ -23,6 +23,8 @@
 /* USER CODE BEGIN Includes */
 #include "stm32f429i_discovery_lcd.h"
 #include "rtos.h"
+#include "arm_math.h"
+#include "SEGGER_SYSVIEW.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,7 +34,12 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define ZERO_IN_ASCII	48
+#define DOT_IN_ASCII	46
+#define APB1_CLOCK		84000000
+#define FFT_SAMPLES		512
+#define FFT_SIZE		(FFT_SAMPLES / 2)
+#define DWT_CTRL 		(*(volatile uint32_t*)0xE0001000)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -41,6 +48,9 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
 DMA2D_HandleTypeDef hdma2d;
 
 I2C_HandleTypeDef hi2c3;
@@ -49,51 +59,154 @@ LTDC_HandleTypeDef hltdc;
 
 SPI_HandleTypeDef hspi3;
 
+TIM_HandleTypeDef htim3;
+
 SDRAM_HandleTypeDef hsdram1;
 
 /* USER CODE BEGIN PV */
-static OS_STACKPTR int stack1[128], stack2[128], stack3[128];
-static OS_TASK LED_task1, LED_task2, LED_task3;
+static OS_TASK FFT_Task, LCD_Task;
+static OS_QUEUE ADC_queue, FFT_queue;
+static OS_STACKPTR int FFT_Task_stack[128], LCD_Task_stack[128];
+static uint32_t ADC_queue_buffer[3];
+static float32_t FFT_queue_buffer[3];
+
+uint32_t DMA_buffer;
+
+float32_t FFT_input[FFT_SAMPLES] = {0};
+float32_t FFT_output[FFT_SAMPLES];
+float32_t freqTable[FFT_SIZE];
+float32_t freqOrder[FFT_SIZE];
+arm_rfft_fast_instance_f32 FFTHandler;
+
+float32_t baseFreq;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_DMA2D_Init(void);
 static void MX_FMC_Init(void);
 static void MX_I2C3_Init(void);
 static void MX_LTDC_Init(void);
 static void MX_SPI3_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
-
+void convert_to_ASCII(float32_t number, uint8_t* ascii);
+void LCD_init(void);
+void FFT_init(float32_t samplingFreq);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void LED_task1_entry()
+void convert_to_ASCII(float32_t number, uint8_t* ascii)
 {
-	while(1)
+	uint32_t number_without_decimals = number * 100;
+
+	uint8_t hundreds = number_without_decimals / 10000;
+	uint8_t tens = (number_without_decimals - (hundreds * 10000)) / 1000;
+	uint8_t ones = (number_without_decimals - (hundreds * 10000) - (tens * 1000)) / 100;
+	uint8_t decimals = (number_without_decimals - (hundreds * 10000) - (tens * 1000) - (ones * 100)) / 10;
+	uint8_t hundredth = (number_without_decimals - (hundreds * 10000) - (tens * 1000) - (ones * 100) - (decimals * 10));
+
+	ascii[0] = hundreds + ZERO_IN_ASCII;
+	ascii[1] = tens + ZERO_IN_ASCII;
+	ascii[2] = ones + ZERO_IN_ASCII;
+	ascii[3] = DOT_IN_ASCII;
+	ascii[4] = decimals + ZERO_IN_ASCII;
+	ascii[5] = hundredth + ZERO_IN_ASCII;
+}
+
+void FFT_init(float32_t samplingFreq)
+{
+	for(uint16_t i = 0; i < FFT_SIZE; i++)
 	{
-		BSP_LCD_DrawCircle(80, 80, 40);
-		OS_TASK_Delay(500);
+		freqOrder[i] = i * samplingFreq / FFT_SAMPLES;
 	}
 }
 
-void LED_task2_entry()
+void LCD_init()
 {
+	BSP_LCD_Init();
+
+	BSP_LCD_LayerDefaultInit(1, LCD_FRAME_BUFFER_LAYER1);
+	BSP_LCD_SelectLayer(1);
+	BSP_LCD_Clear(LCD_COLOR_DARKRED);
+	BSP_LCD_SetColorKeying(1, LCD_COLOR_WHITE);
+	BSP_LCD_SetLayerVisible(1, DISABLE);
+
+	BSP_LCD_LayerDefaultInit(0, LCD_FRAME_BUFFER_LAYER0);
+	BSP_LCD_SelectLayer(0);
+
+	BSP_LCD_DisplayOn();
+
+	BSP_LCD_Clear(LCD_COLOR_LIGHTBLUE);
+}
+
+void FFT_Task_entry()
+{
+	uint32_t *received_from_ADC;
+	uint32_t maxFFTValueIndex = 0;
+	float32_t maxFFTValue = 0;
+	uint16_t freqBufferIndex = 0;
+	float32_t f_s = APB1_CLOCK / (htim3.Init.Prescaler + 1) / (htim3.Init.Period + 1);
+
+	FFT_init(f_s);
+	arm_rfft_fast_init_f32(&FFTHandler, FFT_SAMPLES);
+
 	while(1)
 	{
-		BSP_LCD_DrawCircle(160, 80, 40);
-		OS_TASK_Delay(500);
+		OS_QUEUE_GetPtrBlocked(&ADC_queue, (void**)&received_from_ADC);
+		HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+
+		FFT_input[freqBufferIndex] = (float32_t)(*received_from_ADC);
+		OS_QUEUE_Purge(&ADC_queue);
+		freqBufferIndex++;
+
+		if(freqBufferIndex >= FFT_SAMPLES)
+		{
+			freqBufferIndex = 0;
+
+			arm_rfft_fast_f32(&FFTHandler, FFT_input, FFT_output, 0);
+			arm_cmplx_mag_f32(FFT_output, freqTable, FFT_SIZE);
+			arm_max_f32(freqTable + 1, FFT_SIZE - 1, &maxFFTValue, &maxFFTValueIndex);
+
+			baseFreq = freqOrder[maxFFTValueIndex];
+
+			OS_QUEUE_PutBlocked(&FFT_queue, (void*)&baseFreq, sizeof(baseFreq));
+		}
+
+		OS_TASK_Delay(1);
 	}
 }
 
-void LED_task3_entry()
+void LCD_Task_entry()
 {
+	float32_t *received_from_FFT;
+	uint8_t display_text[6];
+
 	while(1)
 	{
-		BSP_LCD_DrawEllipse(120, 180, 20, 100);
-		OS_TASK_Delay(500);
+		OS_QUEUE_GetPtrBlocked(&FFT_queue, (void**)&received_from_FFT);
+
+		BSP_LCD_Clear(LCD_COLOR_WHITE);
+		convert_to_ASCII(*received_from_FFT, display_text);
+		OS_QUEUE_Purge(&FFT_queue);
+		BSP_LCD_DisplayStringAt(80, 80, (uint8_t*)display_text, LEFT_MODE);
+
+		OS_TASK_Delay(1);
+	}
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* AdcHandle)
+{
+	if (AdcHandle == &hadc1)
+	{
+		HAL_GPIO_TogglePin(LD4_GPIO_Port, LD4_Pin);
+		OS_INT_Enter();
+		OS_QUEUE_Put(&ADC_queue, (void*)&DMA_buffer, sizeof(DMA_buffer));
+		OS_INT_Leave();
 	}
 }
 /* USER CODE END 0 */
@@ -126,44 +239,33 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_DMA2D_Init();
   MX_FMC_Init();
   MX_I2C3_Init();
   MX_LTDC_Init();
   MX_SPI3_Init();
+  MX_ADC1_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  BSP_LCD_Init();
-
-  BSP_LCD_LayerDefaultInit(1, LCD_FRAME_BUFFER_LAYER1);
-     /* Set Foreground Layer */
-  BSP_LCD_SelectLayer(1);
-   /* Clear the LCD */
-  BSP_LCD_Clear(LCD_COLOR_DARKRED);
-  BSP_LCD_SetColorKeying(1, LCD_COLOR_WHITE);
-  BSP_LCD_SetLayerVisible(1, DISABLE);
-
-  /* Layer1 Init */
-  BSP_LCD_LayerDefaultInit(0, LCD_FRAME_BUFFER_LAYER0);
-
-  /* Set Foreground Layer */
-  BSP_LCD_SelectLayer(0);
-
-  /* Enable The LCD */
-  BSP_LCD_DisplayOn();
-
-  /* Clear the LCD */
-  BSP_LCD_Clear(LCD_COLOR_LIGHTMAGENTA);
-
-//  BSP_LCD_DrawCircle(80, 80, 40);
-//  BSP_LCD_DrawCircle(160, 80, 40);
-//  BSP_LCD_DrawEllipse(120, 180, 20, 100);
+  DWT_CTRL |= (1 << 0);
+  LCD_init();
 
   OS_Init();
   OS_InitHW();
 
-  OS_TASK_Create(&LED_task1, "LED Task1", 5, LED_task1_entry, stack1, sizeof(stack1), 1);
-  OS_TASK_Create(&LED_task2, "LED Task2", 5, LED_task2_entry, stack2, sizeof(stack2), 1);
-  OS_TASK_Create(&LED_task3, "LED Task3", 5, LED_task3_entry, stack3, sizeof(stack3), 1);
+  OS_TASK_Create(&FFT_Task, "FFT Task", 4, FFT_Task_entry, FFT_Task_stack, sizeof(FFT_Task_stack), 1);
+  OS_TASK_Create(&LCD_Task, "LCD Task", 4, LCD_Task_entry, LCD_Task_stack, sizeof(LCD_Task_stack), 1);
+  //OS_TASK_Create(&LED_task3, "LED Task3", 5, LED_task3_entry, stack3, sizeof(stack3), 1);
+
+  OS_QUEUE_Create(&ADC_queue, (void*)ADC_queue_buffer, sizeof(ADC_queue_buffer));
+  OS_QUEUE_Create(&FFT_queue, (void*)FFT_queue_buffer, sizeof(FFT_queue_buffer));
+
+  SEGGER_SYSVIEW_Conf();
+  SEGGER_SYSVIEW_Start();
+
+  HAL_TIM_Base_Start_IT(&htim3);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&DMA_buffer, 1);
 
   OS_Start();
 
@@ -223,6 +325,58 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T3_TRGO;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -427,6 +581,67 @@ static void MX_SPI3_Init(void)
   /* USER CODE BEGIN SPI3_Init 2 */
 
   /* USER CODE END SPI3_Init 2 */
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 8400-1;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 10;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream4_IRQn, 15, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream4_IRQn);
 
 }
 
