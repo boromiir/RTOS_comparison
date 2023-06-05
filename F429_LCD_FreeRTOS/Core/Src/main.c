@@ -39,6 +39,7 @@
 #define APB1_CLOCK		84000000
 #define FFT_SAMPLES		512
 #define FFT_SIZE		(FFT_SAMPLES / 2)
+#define DWT_CTRL 		(*(volatile uint32_t*)0xE0001000)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -64,9 +65,8 @@ SDRAM_HandleTypeDef hsdram1;
 
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
-TaskHandle_t *LED_task1;
-TaskHandle_t *LED_task2;
-TaskHandle_t *LED_task3;
+TaskHandle_t *FFT_task;
+TaskHandle_t *LCD_task;
 QueueHandle_t  ADC_queue;
 QueueHandle_t  LCD_queue;
 
@@ -132,7 +132,7 @@ void FFT_init(float32_t samplingFreq)
 	}
 }
 
-void LED_task1_entry()
+void FFT_task_entry()
 {
 	uint32_t received_from_ADC;
 	uint32_t maxFFTValueIndex = 0;
@@ -168,7 +168,7 @@ void LED_task1_entry()
 	}
 }
 
-void LED_task2_entry()
+void LCD_task_entry()
 {
 	float32_t received_from_FFT;
 	uint8_t display_text[6];
@@ -176,6 +176,7 @@ void LED_task2_entry()
 	while(1)
 	{
 		xQueueReceive(LCD_queue, &received_from_FFT, portMAX_DELAY);
+
 		BSP_LCD_Clear(LCD_COLOR_WHITE);
 		convert_to_ASCII(received_from_FFT, display_text);
 		BSP_LCD_DisplayStringAt(80, 80, (uint8_t*)display_text, LEFT_MODE);
@@ -183,13 +184,6 @@ void LED_task2_entry()
 	}
 }
 
-void LED_task3_entry()
-{
-	while(1)
-	{
-
-	}
-}
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* AdcHandle)
 {
@@ -211,23 +205,16 @@ void LCD_init()
 	BSP_LCD_Init();
 
 	BSP_LCD_LayerDefaultInit(1, LCD_FRAME_BUFFER_LAYER1);
-	/* Set Foreground Layer */
 	BSP_LCD_SelectLayer(1);
-	/* Clear the LCD */
 	BSP_LCD_Clear(LCD_COLOR_DARKRED);
 	BSP_LCD_SetColorKeying(1, LCD_COLOR_WHITE);
 	BSP_LCD_SetLayerVisible(1, DISABLE);
 
-	/* Layer1 Init */
 	BSP_LCD_LayerDefaultInit(0, LCD_FRAME_BUFFER_LAYER0);
-
-	/* Set Foreground Layer */
 	BSP_LCD_SelectLayer(0);
 
-	/* Enable The LCD */
 	BSP_LCD_DisplayOn();
 
-	/* Clear the LCD */
 	BSP_LCD_Clear(LCD_COLOR_LIGHTBLUE);
 }
 /* USER CODE END 0 */
@@ -270,11 +257,9 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 
+  DWT_CTRL |= (1 << 0);
+  NVIC_SetPriorityGrouping( 0 );
   LCD_init();
-
-//  BSP_LCD_DrawCircle(80, 80, 40);
-//  BSP_LCD_DrawCircle(160, 80, 40);
-//  BSP_LCD_DrawEllipse(120, 180, 20, 100);
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -302,12 +287,18 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  xTaskCreate(LED_task1_entry, "LED Task1", configMINIMAL_STACK_SIZE, NULL, 3, LED_task1);
-  xTaskCreate(LED_task2_entry, "LED Task2", configMINIMAL_STACK_SIZE, NULL, 3, LED_task2);
-  //xTaskCreate(LED_task3_entry, "LED Task3", configMINIMAL_STACK_SIZE, NULL, 3, LED_task3);
+  xTaskCreate(FFT_task_entry, "FFT Task", configMINIMAL_STACK_SIZE, NULL, 3, FFT_task);
+  xTaskCreate(LCD_task_entry, "LCD Task", configMINIMAL_STACK_SIZE, NULL, 3, LCD_task);
 
+  /* I do it here because it has to be done afer initializing queue - if not then Timer will launch DMA
+   * conversion callback with not initialized queue handler.
+   */
   HAL_TIM_Base_Start_IT(&htim3);
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&DMA_buffer, 1);
+
+  SEGGER_SYSVIEW_Conf();
+  SEGGER_SYSVIEW_Start();
+
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
